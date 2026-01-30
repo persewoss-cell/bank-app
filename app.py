@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 
-WEBAPP_URL = "여기에_너의_웹앱_URL"  # https://script.google.com/macros/s/.../exec
+WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzwbS_dIJGHTe4oyNK9QMWm0CXqqjgMJ3p-q0MQANqZ0mUQhrHPOIHVSgcH41vrLep-/exec"  # https://script.google.com/macros/s/.../exec
 
 st.set_page_config(page_title="학생 포인트 통장", layout="wide")
 st.title("🏦 학생 포인트 통장")
