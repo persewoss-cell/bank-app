@@ -1,12 +1,51 @@
 import streamlit as st
 import pandas as pd
 import requests
+from datetime import datetime, timezone, timedelta
 
 # ✅ 너의 구글 Apps Script 웹앱 URL (/exec 로 끝나는 주소)
 WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzwbS_dIJGHTe4oyNK9QMWm0CXqqjgMJ3p-q0MQANqZ0mUQhrHPOIHVSgcH41vrLep-/exec"
 
 st.set_page_config(page_title="학생 포인트 통장", layout="wide")
 st.title("🏦 학생 포인트 통장")
+
+# -------------------------
+# 날짜시간 한국식 포맷 변환
+# yyyy년 mm월 dd일 오전/오후 00시 00분
+# -------------------------
+KST = timezone(timedelta(hours=9))
+
+def format_kr_datetime(val) -> str:
+    if val is None or val == "":
+        return ""
+
+    if isinstance(val, datetime):
+        dt = val
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        else:
+            dt = dt.astimezone(KST)
+    else:
+        s = str(val).strip()
+        try:
+            # 예: 2026-01-30T13:35:02.000Z
+            if "T" in s and s.endswith("Z"):
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(KST)
+            else:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=KST)
+                else:
+                    dt = dt.astimezone(KST)
+        except Exception:
+            return s  # 파싱 실패 시 원문
+
+    ampm = "오전" if dt.hour < 12 else "오후"
+    hour12 = dt.hour % 12
+    if hour12 == 0:
+        hour12 = 12
+
+    return f"{dt.year}년 {dt.month:02d}월 {dt.day:02d}일 {ampm} {hour12:02d}시 {dt.minute:02d}분"
 
 
 # -------------------------
@@ -18,6 +57,10 @@ def api_list_accounts():
 
 def api_create_account(name, pin):
     r = requests.post(WEBAPP_URL, json={"action": "create_account", "name": name, "pin": pin}, timeout=10)
+    return r.json()
+
+def api_delete_account(name, pin):
+    r = requests.post(WEBAPP_URL, json={"action": "delete_account", "name": name, "pin": pin}, timeout=10)
     return r.json()
 
 def api_add_tx(name, pin, memo, deposit, withdraw):
@@ -44,8 +87,11 @@ def pin_ok(pin: str) -> bool:
 
 
 # -------------------------
-# Sidebar: account creation
+# Sidebar: account creation + deletion
 # -------------------------
+if "delete_confirm" not in st.session_state:
+    st.session_state.delete_confirm = False
+
 with st.sidebar:
     st.header("➕ 계정 만들기")
     st.caption("이름 + 4자리 비밀번호로 계정을 만들면, 구글시트에 그 이름 탭이 자동 생성됩니다.")
@@ -53,18 +99,56 @@ with st.sidebar:
     new_name = st.text_input("이름(계정)", key="new_name").strip()
     new_pin = st.text_input("비밀번호(4자리 숫자)", type="password", key="new_pin").strip()
 
-    if st.button("계정 생성"):
-        if not new_name:
-            st.error("이름을 입력해 주세요.")
-        elif not pin_ok(new_pin):
-            st.error("비밀번호는 4자리 숫자여야 해요. (예: 0123)")
-        else:
-            res = api_create_account(new_name, new_pin)
-            if res.get("ok"):
-                st.success("계정 생성 완료! 상단 탭에서 계정을 선택하세요.")
-                st.rerun()
+    cbtn1, cbtn2 = st.columns(2)
+
+    with cbtn1:
+        if st.button("계정 생성"):
+            if not new_name:
+                st.error("이름을 입력해 주세요.")
+            elif not pin_ok(new_pin):
+                st.error("비밀번호는 4자리 숫자여야 해요. (예: 0123)")
             else:
-                st.error(res.get("error", "계정 생성 실패"))
+                res = api_create_account(new_name, new_pin)
+                if res.get("ok"):
+                    st.success("계정 생성 완료! 상단 탭에서 계정을 선택하세요.")
+                    st.session_state.delete_confirm = False
+                    st.rerun()
+                else:
+                    st.error(res.get("error", "계정 생성 실패"))
+
+    with cbtn2:
+        if st.button("삭제"):
+            # 삭제 버튼 누르면 확인 단계로 진입
+            st.session_state.delete_confirm = True
+
+    # 확인 UI (팝업 대신 확인 영역)
+    if st.session_state.delete_confirm:
+        st.warning("정말로 삭제하시겠습니까?")
+        st.caption("※ 삭제하면 해당 계정 탭(통장 내역)도 함께 삭제됩니다.")
+
+        y, n = st.columns(2)
+        with y:
+            if st.button("예", key="delete_yes"):
+                if not new_name:
+                    st.error("삭제할 이름(계정)을 입력해 주세요.")
+                elif not pin_ok(new_pin):
+                    st.error("비밀번호는 4자리 숫자여야 해요. (예: 0123)")
+                else:
+                    res = api_delete_account(new_name, new_pin)
+                    if res.get("ok"):
+                        st.success("삭제 완료!")
+                        st.session_state.delete_confirm = False
+                        # 입력칸도 비워주기(선택)
+                        st.session_state.new_name = ""
+                        st.session_state.new_pin = ""
+                        st.rerun()
+                    else:
+                        st.error(res.get("error", "삭제 실패"))
+
+        with n:
+            if st.button("아니오", key="delete_no"):
+                st.session_state.delete_confirm = False
+                st.rerun()
 
 
 # -------------------------
@@ -93,7 +177,6 @@ for idx, tab in enumerate(tabs):
     with tab:
         st.markdown(f"### ✅ 현재 선택: **{name}**")
 
-        # PIN 입력(조회/저장용)
         pin = st.text_input(
             "비밀번호(4자리) 입력(조회/저장용)",
             type="password",
@@ -102,9 +185,7 @@ for idx, tab in enumerate(tabs):
 
         st.divider()
 
-        # -------------------------
-        # Transaction input
-        # -------------------------
+        # 거래 기록
         st.subheader("📝 거래 기록(통장에 찍기)")
         memo = st.text_input("내역", key=f"memo_{name}").strip()
 
@@ -131,9 +212,7 @@ for idx, tab in enumerate(tabs):
 
         st.divider()
 
-        # -------------------------
-        # Passbook view
-        # -------------------------
+        # 통장 내역
         st.subheader("📒 통장 내역")
 
         if not pin_ok(pin):
@@ -161,6 +240,9 @@ for idx, tab in enumerate(tabs):
         # 총액(누적)
         df["변동"] = df["deposit"] - df["withdraw"]
         df["총액"] = df["변동"].cumsum()
+
+        # 날짜 포맷 변환(핵심)
+        df["datetime"] = df["datetime"].apply(format_kr_datetime)
 
         view = df.rename(columns={
             "datetime": "날짜-시간",
