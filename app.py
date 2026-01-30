@@ -372,9 +372,9 @@ for idx, tab in enumerate(tabs):
                         toast("저장 완료!", icon="✅")
                         # 입력칸 정리(충돌 없이 pop)
                         st.session_state.pop(f"memo_{name}", None)
-st.session_state.pop(dep_key, None)
-st.session_state.pop(wd_key, None)
-st.rerun()
+                        st.session_state.pop(dep_key, None)
+                        st.session_state.pop(wd_key, None)
+                        st.rerun()
                     else:
                         st.error(res.get("error","저장 실패"))
 
