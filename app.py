@@ -10,6 +10,10 @@ st.title("🏦 학생 포인트 통장")
 
 KST = timezone(timedelta(hours=9))
 
+# -------------------------
+# requests 세션(연결 재사용) - 체감 소폭 개선
+# -------------------------
+SESSION = requests.Session()
 
 # -------------------------
 # Utils
@@ -17,7 +21,6 @@ KST = timezone(timedelta(hours=9))
 def format_kr_datetime(val) -> str:
     if val is None or val == "":
         return ""
-    # GAS에서 Date가 올 때 ISO(…Z) 형태가 많음
     if isinstance(val, datetime):
         dt = val
         if dt.tzinfo is None:
@@ -57,36 +60,58 @@ def toast(msg: str, icon: str = "✅"):
 
 
 def rate_by_weeks(weeks: int) -> float:
-    # 1주=5%, 10주=50% (주*5%)
-    return weeks * 0.05
+    return weeks * 0.05  # 1주=5%
 
 
 def compute_preview(principal: int, weeks: int):
     r = rate_by_weeks(weeks)
-    interest = round(principal * r)  # 원 단위 반올림
+    interest = round(principal * r)
     maturity = principal + interest
     maturity_date = (datetime.now(KST) + timedelta(days=weeks * 7)).date()
     return r, interest, maturity, maturity_date
+
+
+def parse_iso_to_date(iso_str: str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.date()
+    except Exception:
+        return None
+
+
+def build_df(headers, rows):
+    if not rows:
+        return pd.DataFrame(columns=["tx_id", "datetime", "memo", "deposit", "withdraw", "총액"])
+    df = pd.DataFrame(rows, columns=headers)
+    df["deposit"] = pd.to_numeric(df["deposit"], errors="coerce").fillna(0).astype(int)
+    df["withdraw"] = pd.to_numeric(df["withdraw"], errors="coerce").fillna(0).astype(int)
+    df["변동"] = df["deposit"] - df["withdraw"]
+    df["총액"] = df["변동"].cumsum()
+    df["datetime"] = df["datetime"].apply(format_kr_datetime)
+    return df
 
 
 # -------------------------
 # API wrappers
 # -------------------------
 def api_get(params: dict):
-    r = requests.get(WEBAPP_URL, params=params, timeout=20)
+    r = SESSION.get(WEBAPP_URL, params=params, timeout=20)
     return r.json()
 
 
 def api_post(payload: dict):
-    r = requests.post(WEBAPP_URL, json=payload, timeout=20)
+    r = SESSION.post(WEBAPP_URL, json=payload, timeout=20)
     return r.json()
 
 
-def api_list_accounts():
+# 캐시: 계정/템플릿 (자주 안 바뀜)
+@st.cache_data(ttl=30)
+def api_list_accounts_cached():
     return api_get({"action": "list_accounts"})
 
 
-def api_list_templates():
+@st.cache_data(ttl=300)
+def api_list_templates_cached():
     return api_get({"action": "list_templates"})
 
 
@@ -111,13 +136,6 @@ def api_get_txs(name, pin):
 
 def api_undo_last_n(name, pin, n):
     return api_post({"action": "undo_last_n", "name": name, "pin": pin, "n": int(n)})
-
-
-def api_update_tx_amount(name, pin, tx_id, new_amount):
-    return api_post(
-        {"action": "update_transaction_amount", "name": name, "pin": pin,
-         "tx_id": tx_id, "new_amount": int(new_amount)}
-    )
 
 
 def api_savings_list(name, pin):
@@ -204,6 +222,59 @@ if "admin_ok" not in st.session_state:
     st.session_state.admin_ok = False
 if "bulk_confirm" not in st.session_state:
     st.session_state.bulk_confirm = False
+if "data" not in st.session_state:
+    # 계정별 데이터 캐시: {name: {"tx_res":..., "df":..., "balance":..., "savings":..., "goal":..., "ts":datetime}}
+    st.session_state.data = {}
+if "last_maturity_check" not in st.session_state:
+    # {name: datetime}
+    st.session_state.last_maturity_check = {}
+
+
+def refresh_account_data(name: str, pin: str, force: bool = False):
+    """한 계정의 화면 데이터를 session_state에 저장.
+    force=False면 최근에 이미 불러왔으면(예: 3초) 재호출을 줄임.
+    """
+    now = datetime.now(KST)
+    slot = st.session_state.data.get(name, {})
+    last_ts = slot.get("ts")
+
+    if (not force) and last_ts and (now - last_ts).total_seconds() < 3:
+        return
+
+    tx_res = api_get_txs(name, pin)
+    if not tx_res.get("ok"):
+        st.session_state.data[name] = {"error": tx_res.get("error", "내역 로드 실패"), "ts": now}
+        return
+
+    headers = tx_res.get("headers", ["tx_id", "datetime", "memo", "deposit", "withdraw"])
+    rows = tx_res.get("rows", [])
+    df = build_df(headers, rows)
+    balance = int(df["총액"].iloc[-1]) if len(df) else 0
+
+    sres = api_savings_list(name, pin)
+    savings = sres.get("savings", []) if isinstance(sres, dict) and sres.get("ok") else []
+
+    gres = api_get_goal(name, pin)
+    goal = gres if isinstance(gres, dict) and gres.get("ok") else {"ok": False, "error": gres.get("error", "목표 로드 실패") if isinstance(gres, dict) else "목표 로드 실패"}
+
+    st.session_state.data[name] = {
+        "tx_res": tx_res,
+        "df": df,
+        "balance": balance,
+        "savings": savings,
+        "goal": goal,
+        "ts": now
+    }
+
+
+def maybe_check_maturities(name: str, pin: str):
+    """만기 자동 반환을 매 리런마다 하지 않도록(속도/잠금 방지) 2분에 한 번만."""
+    now = datetime.now(KST)
+    last = st.session_state.last_maturity_check.get(name)
+    if last and (now - last).total_seconds() < 120:
+        return None
+    st.session_state.last_maturity_check[name] = now
+    return api_process_maturities(name, pin)
 
 
 # -------------------------
@@ -229,6 +300,8 @@ with st.sidebar:
                     st.session_state.delete_confirm = False
                     st.session_state.pop("new_name", None)
                     st.session_state.pop("new_pin", None)
+                    # ✅ 계정 목록 캐시 무효화
+                    api_list_accounts_cached.clear()
                     st.rerun()
                 else:
                     st.error(res.get("error", "계정 생성 실패"))
@@ -260,9 +333,12 @@ with st.sidebar:
                         st.session_state.pop("new_name", None)
                         st.session_state.pop("new_pin", None)
                         st.session_state.saved_pins.pop(name, None)
-                        # 삭제된 계정 관련 입력값(위젯 key)도 정리
                         st.session_state.pop(f"pin_{name}", None)
                         st.session_state.pop(f"remember_{name}", None)
+                        # ✅ 계정 목록 캐시 무효화
+                        api_list_accounts_cached.clear()
+                        # ✅ 계정 데이터 캐시에서도 제거
+                        st.session_state.data.pop(name, None)
                         st.rerun()
                     else:
                         st.error(res.get("error", "삭제 실패"))
@@ -292,10 +368,9 @@ with st.sidebar:
 
             st.subheader("🧩 내역 템플릿 관리")
 
-            tpl_res = api_list_templates()
+            tpl_res = api_list_templates_cached()
             templates = tpl_res.get("templates", []) if tpl_res.get("ok") else []
 
-            # ✅ ID는 숨기고, 내역/종류/금액만 표로 보여줌
             if templates:
                 show_rows = []
                 for t in templates:
@@ -308,7 +383,6 @@ with st.sidebar:
             st.caption("추가/수정")
             mode = st.radio("작업", ["추가", "수정"], horizontal=True, key="tpl_mode")
 
-            # 수정 모드면 label로 고르게
             edit_id = ""
             edit_label_default = ""
             edit_kind_default = "deposit"
@@ -340,6 +414,8 @@ with st.sidebar:
                     res = api_admin_upsert_template(admin_pin, tid, tpl_label, tpl_kind, tpl_amount)
                     if res.get("ok"):
                         toast("템플릿 저장 완료!", icon="🧩")
+                        # ✅ 템플릿 캐시 무효화
+                        api_list_templates_cached.clear()
                         st.rerun()
                     else:
                         st.error(res.get("error", "템플릿 저장 실패"))
@@ -363,6 +439,8 @@ with st.sidebar:
                             if res.get("ok"):
                                 toast("삭제 완료!", icon="🗑️")
                                 st.session_state["tpl_del_confirm"] = False
+                                # ✅ 템플릿 캐시 무효화
+                                api_list_templates_cached.clear()
                                 st.rerun()
                             else:
                                 st.error(res.get("error", "삭제 실패"))
@@ -424,9 +502,9 @@ with st.sidebar:
 
 
 # -------------------------
-# Main: Accounts + Tabs
+# Main: Accounts (한 계정만 로딩!)
 # -------------------------
-accounts_res = api_list_accounts()
+accounts_res = api_list_accounts_cached()
 if not accounts_res.get("ok"):
     st.error(accounts_res.get("error", "계정 목록을 불러오지 못했어요."))
     st.stop()
@@ -436,8 +514,8 @@ if not accounts:
     st.info("아직 계정이 없어요. 왼쪽에서 계정을 먼저 만들어 주세요.")
     st.stop()
 
-# 템플릿 캐시
-tpl_res = api_list_templates()
+# 템플릿(캐시)
+tpl_res = api_list_templates_cached()
 TEMPLATES = tpl_res.get("templates", []) if tpl_res.get("ok") else []
 TEMPLATE_BY_LABEL = {t["label"]: t for t in TEMPLATES}
 
@@ -447,387 +525,343 @@ if not filtered:
     st.warning("검색 결과가 없어요.")
     st.stop()
 
-tabs = st.tabs(filtered)
+# --- '탭처럼' 보이는 계정 선택 UI (드롭다운 아님)
+st.caption("계정을 선택하세요 (한 계정만 불러와서 속도가 빨라집니다)")
+if hasattr(st, "segmented_control"):
+    selected = st.segmented_control("계정", options=filtered, default=filtered[0], key="selected_account")
+else:
+    selected = st.radio("계정", filtered, horizontal=True, key="selected_account")
 
+name = selected
 
-def build_df(headers, rows):
-    if not rows:
-        return pd.DataFrame(columns=["tx_id", "datetime", "memo", "deposit", "withdraw", "총액"])
-    df = pd.DataFrame(rows, columns=headers)
-    df["deposit"] = pd.to_numeric(df["deposit"], errors="coerce").fillna(0).astype(int)
-    df["withdraw"] = pd.to_numeric(df["withdraw"], errors="coerce").fillna(0).astype(int)
-    df["변동"] = df["deposit"] - df["withdraw"]
-    df["총액"] = df["변동"].cumsum()
-    df["datetime"] = df["datetime"].apply(format_kr_datetime)
-    return df
+st.markdown(f"## 🧾 {name} 통장")
 
+saved = st.session_state.saved_pins.get(name, "")
+pin_key = f"pin_{name}"
+if pin_key not in st.session_state and saved:
+    st.session_state[pin_key] = saved
 
-for idx, tab in enumerate(tabs):
-    name = filtered[idx]
-    with tab:
-        st.markdown(f"## 🧾 {name} 통장")
+pin = st.text_input("비밀번호(4자리) 입력(조회/저장용)", type="password", key=pin_key).strip()
+remember = st.checkbox("PIN 기억하기(이번 접속 동안)", value=bool(saved), key=f"remember_{name}")
+if remember and pin_ok(pin):
+    st.session_state.saved_pins[name] = pin
+if not remember:
+    st.session_state.saved_pins.pop(name, None)
 
-        saved = st.session_state.saved_pins.get(name, "")
-        pin_key = f"pin_{name}"
-        if pin_key not in st.session_state and saved:
-            st.session_state[pin_key] = saved
+if not pin_ok(pin):
+    st.info("비밀번호(4자리 숫자)를 입력하면 통장 기능이 활성화돼요.")
+    st.stop()
 
-        pin = st.text_input("비밀번호(4자리) 입력(조회/저장용)", type="password", key=pin_key).strip()
-        remember = st.checkbox("PIN 기억하기(이번 접속 동안)", value=bool(saved), key=f"remember_{name}")
-        if remember and pin_ok(pin):
-            st.session_state.saved_pins[name] = pin
-        if not remember:
-            st.session_state.saved_pins.pop(name, None)
+# 만기 자동 반환: 매 리런마다 X (2분에 한 번만)
+mat = maybe_check_maturities(name, pin)
+if mat and mat.get("ok") and mat.get("matured_count", 0) > 0:
+    st.success(f"🎉 만기 도착! 적금 {mat['matured_count']}건 자동 반환 (+{mat['paid_total']} 포인트)")
 
-        if not pin_ok(pin):
-            st.info("비밀번호(4자리 숫자)를 입력하면 통장 기능이 활성화돼요.")
-            continue
+# 화면 데이터 로드(세션 캐시)
+refresh_account_data(name, pin, force=False)
+slot = st.session_state.data.get(name, {})
+if slot.get("error"):
+    st.error(slot["error"])
+    st.stop()
 
-        # 만기 자동 반환
-        mat = api_process_maturities(name, pin)
-        if mat.get("ok") and mat.get("matured_count", 0) > 0:
-            st.success(f"🎉 만기 도착! 적금 {mat['matured_count']}건 자동 반환 (+{mat['paid_total']} 포인트)")
+df = slot["df"]
+balance = int(slot["balance"])
+savings_cached = slot.get("savings", [])
+goal_cached = slot.get("goal", {"ok": False})
 
-        # 거래 내역
-        tx_res = api_get_txs(name, pin)
-        if not tx_res.get("ok"):
-            st.error(tx_res.get("error", "내역을 불러오지 못했어요."))
-            continue
+st.write(f"### 현재 잔액: **{balance} 포인트**")
 
-        headers = tx_res.get("headers", ["tx_id", "datetime", "memo", "deposit", "withdraw"])
-        rows = tx_res.get("rows", [])
-        df = build_df(headers, rows)
-        balance = int(df["총액"].iloc[-1]) if len(df) else 0
-        st.write(f"### 현재 잔액: **{balance} 포인트**")
+# -------------------------
+# 화면 탭(거래/적금/목표)
+# -------------------------
+sub1, sub2, sub3 = st.tabs(["📝 거래", "💰 적금", "🎯 목표"])
 
-        st.divider()
+# -------------------------
+# 1) 거래
+# -------------------------
+with sub1:
+    st.subheader("📝 거래 기록(통장에 찍기)")
 
-        # -------------------------
-        # 화면 탭(거래/적금/목표)
-        # -------------------------
-        sub1, sub2, sub3 = st.tabs(["📝 거래", "💰 적금", "🎯 목표"])
+    memo_key = f"memo_{name}"
+    dep_key = f"dep_{name}"
+    wd_key = f"wd_{name}"
+    tpl_sel_key = f"tpl_sel_{name}"
 
-        # -------------------------
-        # 1) 거래
-        # -------------------------
-        with sub1:
-            st.subheader("📝 거래 기록(통장에 찍기)")
+    if memo_key not in st.session_state:
+        st.session_state[memo_key] = ""
+    if dep_key not in st.session_state:
+        st.session_state[dep_key] = 0
+    if wd_key not in st.session_state:
+        st.session_state[wd_key] = 0
+    if tpl_sel_key not in st.session_state:
+        st.session_state[tpl_sel_key] = "(직접 입력)"
 
-            memo_key = f"memo_{name}"
-            dep_key = f"dep_{name}"
-            wd_key = f"wd_{name}"
-            tpl_sel_key = f"tpl_sel_{name}"
+    clear_key = f"clear_after_save_{name}"
+    if clear_key not in st.session_state:
+        st.session_state[clear_key] = False
 
-            # 기본값 미리 세팅 (중요: 위젯 만들기 전에!)
-            if memo_key not in st.session_state:
-                st.session_state[memo_key] = ""
-            if dep_key not in st.session_state:
-                st.session_state[dep_key] = 0
-            if wd_key not in st.session_state:
-                st.session_state[wd_key] = 0
-            if tpl_sel_key not in st.session_state:
-                st.session_state[tpl_sel_key] = "(직접 입력)"
-            # ✅ 저장 후 입력칸 초기화는 '다음 실행(run)'에서만 처리(크래시 방지)
-            clear_key = f"clear_after_save_{name}"
-            if clear_key not in st.session_state:
-                st.session_state[clear_key] = False
+    if st.session_state[clear_key]:
+        st.session_state[memo_key] = ""
+        st.session_state[dep_key] = 0
+        st.session_state[wd_key] = 0
+        st.session_state[tpl_sel_key] = "(직접 입력)"
+        st.session_state[clear_key] = False
 
-            if st.session_state[clear_key]:
-                st.session_state[memo_key] = ""
-                st.session_state[dep_key] = 0
-                st.session_state[wd_key] = 0
-                st.session_state[tpl_sel_key] = "(직접 입력)"
-                st.session_state[clear_key] = False
-
-            def on_template_change():
-                sel = st.session_state[tpl_sel_key]
-                if sel != "(직접 입력)":
-                    tpl = TEMPLATE_BY_LABEL.get(sel)
-                    if tpl:
-                        st.session_state[memo_key] = tpl["label"]
-                        amt = int(tpl["amount"])
-                        if tpl["kind"] == "deposit":
-                            st.session_state[dep_key] = amt
-                            st.session_state[wd_key] = 0
-                        else:
-                            st.session_state[wd_key] = amt
-                            st.session_state[dep_key] = 0
-
-            labels = ["(직접 입력)"] + [t["label"] for t in TEMPLATES]
-            st.selectbox("내역 템플릿", labels, key=tpl_sel_key, on_change=on_template_change)
-
-            st.text_input("내역", key=memo_key)
-
-            st.caption("빠른 입금")
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                if st.button("+10", key=f"q10_{name}"):
-                    st.session_state[dep_key] = int(st.session_state[dep_key]) + 10
+    def on_template_change():
+        sel = st.session_state[tpl_sel_key]
+        if sel != "(직접 입력)":
+            tpl = TEMPLATE_BY_LABEL.get(sel)
+            if tpl:
+                st.session_state[memo_key] = tpl["label"]
+                amt = int(tpl["amount"])
+                if tpl["kind"] == "deposit":
+                    st.session_state[dep_key] = amt
                     st.session_state[wd_key] = 0
-                    st.rerun()
-            with b2:
-                if st.button("+50", key=f"q50_{name}"):
-                    st.session_state[dep_key] = int(st.session_state[dep_key]) + 50
-                    st.session_state[wd_key] = 0
-                    st.rerun()
-            with b3:
-                if st.button("+100", key=f"q100_{name}"):
-                    st.session_state[dep_key] = int(st.session_state[dep_key]) + 100
-                    st.session_state[wd_key] = 0
-                    st.rerun()
+                else:
+                    st.session_state[wd_key] = amt
+                    st.session_state[dep_key] = 0
 
-            cA, cB = st.columns(2)
-            with cA:
-                st.number_input("입금", min_value=0, step=1, key=dep_key)
-            with cB:
-                st.number_input("출금", min_value=0, step=1, key=wd_key)
+    labels = ["(직접 입력)"] + [t["label"] for t in TEMPLATES]
+    st.selectbox("내역 템플릿", labels, key=tpl_sel_key, on_change=on_template_change)
 
-            col_btn1, col_btn2 = st.columns([1, 1])
-            with col_btn1:
-                if st.button("저장", key=f"save_{name}"):
-                    memo = st.session_state[memo_key].strip()
-                    deposit = int(st.session_state[dep_key])
-                    withdraw = int(st.session_state[wd_key])
+    st.text_input("내역", key=memo_key)
 
-                    if not memo:
-                        st.error("내역을 입력해 주세요.")
-                    elif (deposit > 0 and withdraw > 0) or (deposit == 0 and withdraw == 0):
-                        st.error("입금/출금은 둘 중 하나만 입력해 주세요.")
-                    elif withdraw > balance:
-                        st.error("출금 금액이 현재 잔액보다 커요.")
-                    else:
-                        res = api_add_tx(name, pin, memo, deposit, withdraw)
-                        if res.get("ok"):
-                            toast("저장 완료!", icon="✅")
-                            st.session_state[clear_key] = True
-                            st.rerun()
-                        else:
-                            st.error(res.get("error", "저장 실패"))
+    st.caption("빠른 입금")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("+10", key=f"q10_{name}"):
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 10
+            st.session_state[wd_key] = 0
+            st.rerun()
+    with b2:
+        if st.button("+50", key=f"q50_{name}"):
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 50
+            st.session_state[wd_key] = 0
+            st.rerun()
+    with b3:
+        if st.button("+100", key=f"q100_{name}"):
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 100
+            st.session_state[wd_key] = 0
+            st.rerun()
 
-            with col_btn2:
-                undo_n = st.selectbox("되돌리기(최근)", [1, 2, 3], index=0, key=f"undo_n_{name}")
-                if st.button("되돌리기", key=f"undo_btn_{name}"):
-                    st.session_state[f"undo_confirm_{name}"] = True
+    cA, cB = st.columns(2)
+    with cA:
+        st.number_input("입금", min_value=0, step=1, key=dep_key)
+    with cB:
+        st.number_input("출금", min_value=0, step=1, key=wd_key)
 
-            if st.session_state.get(f"undo_confirm_{name}", False):
-                st.warning(f"정말로 최근 {undo_n}건을 되돌리시겠습니까?")
-                y, n = st.columns(2)
-                with y:
-                    if st.button("예", key=f"undo_yes_{name}"):
-                        res = api_undo_last_n(name, pin, undo_n)
-                        if res.get("ok"):
-                            toast(f"최근 {undo_n}건 되돌림 완료", icon="↩️")
-                            st.session_state[f"undo_confirm_{name}"] = False
-                            st.rerun()
-                        else:
-                            st.error(res.get("error", "되돌리기 실패"))
-                with n:
-                    if st.button("아니오", key=f"undo_no_{name}"):
-                        st.session_state[f"undo_confirm_{name}"] = False
-                        st.rerun()
+    col_btn1, col_btn2 = st.columns([1, 1])
 
-        # -------------------------
-        # 2) 적금 (다시 추가 + 가입 전 미리보기 + 10단위)
-        # -------------------------
-        with sub2:
-            st.subheader("💰 적금")
+    with col_btn1:
+        if st.button("저장", key=f"save_{name}"):
+            memo = st.session_state[memo_key].strip()
+            deposit = int(st.session_state[dep_key])
+            withdraw = int(st.session_state[wd_key])
 
-            # 가입 전 미리보기
-            p = st.number_input("적금 원금(10단위)", min_value=10, step=10, value=100, key=f"sv_p_{name}")
-            w = st.selectbox("기간(1~10주)", list(range(1, 11)), index=4, key=f"sv_w_{name}")
-
-            r, interest, maturity_amt, maturity_date = compute_preview(int(p), int(w))
-
-            st.info(
-                f"✅ 미리보기\n\n"
-                f"- 이자율: **{int(r*100)}%**\n"
-                f"- 만기일: **{maturity_date.strftime('%Y-%m-%d')}**\n"
-                f"- 만기 수령액: **{maturity_amt} 포인트** (원금 {p} + 이자 {interest})"
-            )
-
-            if p > balance:
-                st.warning("⚠️ 현재 잔액보다 원금이 커서 가입할 수 없어요.")
-
-            if st.button("적금 가입", key=f"sv_join_{name}", disabled=(p > balance)):
-                res = api_savings_create(name, pin, int(p), int(w))
+            if not memo:
+                st.error("내역을 입력해 주세요.")
+            elif (deposit > 0 and withdraw > 0) or (deposit == 0 and withdraw == 0):
+                st.error("입금/출금은 둘 중 하나만 입력해 주세요.")
+            elif withdraw > balance:
+                st.error("출금 금액이 현재 잔액보다 커요.")
+            else:
+                res = api_add_tx(name, pin, memo, deposit, withdraw)
                 if res.get("ok"):
-                    toast("적금 가입 완료!", icon="💰")
+                    toast("저장 완료!", icon="✅")
+                    st.session_state[clear_key] = True
+                    # ✅ 저장 후에만 데이터 갱신
+                    refresh_account_data(name, pin, force=True)
                     st.rerun()
                 else:
-                    st.error(res.get("error", "적금 가입 실패"))
+                    st.error(res.get("error", "저장 실패"))
 
-            st.divider()
+    with col_btn2:
+        undo_n = st.selectbox("되돌리기(최근)", [1, 2, 3], index=0, key=f"undo_n_{name}")
+        if st.button("되돌리기", key=f"undo_btn_{name}"):
+            st.session_state[f"undo_confirm_{name}"] = True
 
-            # 적금 목록
-            sres = api_savings_list(name, pin)
-            if not sres.get("ok"):
-                st.error(sres.get("error", "적금 목록을 불러오지 못했어요."))
-            else:
-                savings = sres.get("savings", [])
-                if not savings:
-                    st.info("적금이 아직 없어요.")
+    if st.session_state.get(f"undo_confirm_{name}", False):
+        st.warning(f"정말로 최근 {undo_n}건을 되돌리시겠습니까?")
+        y, n = st.columns(2)
+        with y:
+            if st.button("예", key=f"undo_yes_{name}"):
+                res = api_undo_last_n(name, pin, undo_n)
+                if res.get("ok"):
+                    toast(f"최근 {undo_n}건 되돌림 완료", icon="↩️")
+                    st.session_state[f"undo_confirm_{name}"] = False
+                    refresh_account_data(name, pin, force=True)
+                    st.rerun()
                 else:
-                    # 상태별 표시
-                    active = [s for s in savings if s.get("status") == "active"]
-                    matured = [s for s in savings if s.get("status") == "matured"]
-                    canceled = [s for s in savings if s.get("status") == "canceled"]
+                    st.error(res.get("error", "되돌리기 실패"))
+        with n:
+            if st.button("아니오", key=f"undo_no_{name}"):
+                st.session_state[f"undo_confirm_{name}"] = False
+                st.rerun()
 
-                    if active:
-                        st.markdown("### 🟢 진행 중 적금")
-                        for s in active:
-                            sid = s["savings_id"]
-                            principal = int(s["principal"])
-                            weeks = int(s["weeks"])
-                            interest2 = int(s["interest"])
-                            maturity_dt = format_kr_datetime(s["maturity_datetime"])
-                            st.write(f"- 원금 **{principal}**, 기간 **{weeks}주**, 만기일 **{maturity_dt}**, 만기 이자 **{interest2}**")
+# -------------------------
+# 2) 적금
+# -------------------------
+with sub2:
+    st.subheader("💰 적금")
 
-                            # 해지 버튼(만기 전이면 확인)
-                            if st.button("해지", key=f"sv_cancel_btn_{name}_{sid}"):
-                                st.session_state[f"sv_cancel_confirm_{sid}"] = True
+    p = st.number_input("적금 원금(10단위)", min_value=10, step=10, value=100, key=f"sv_p_{name}")
+    w = st.selectbox("기간(1~10주)", list(range(1, 11)), index=4, key=f"sv_w_{name}")
 
-                            if st.session_state.get(f"sv_cancel_confirm_{sid}", False):
-                                st.warning("정말로 해지하시겠습니까? (원금만 반환)")
-                                y, n = st.columns(2)
-                                with y:
-                                    if st.button("예", key=f"sv_cancel_yes_{name}_{sid}"):
-                                        res = api_savings_cancel(name, pin, sid)
-                                        if res.get("ok"):
-                                            toast(f"해지 완료! (+{res.get('refunded',0)})", icon="🧾")
-                                            st.session_state[f"sv_cancel_confirm_{sid}"] = False
-                                            st.rerun()
-                                        else:
-                                            st.error(res.get("error", "해지 실패"))
-                                with n:
-                                    if st.button("아니오", key=f"sv_cancel_no_{name}_{sid}"):
-                                        st.session_state[f"sv_cancel_confirm_{sid}"] = False
-                                        st.rerun()
+    r, interest, maturity_amt, maturity_date = compute_preview(int(p), int(w))
+    st.info(
+        f"✅ 미리보기\n\n"
+        f"- 이자율: **{int(r*100)}%**\n"
+        f"- 만기일: **{maturity_date.strftime('%Y-%m-%d')}**\n"
+        f"- 만기 수령액: **{maturity_amt} 포인트** (원금 {p} + 이자 {interest})"
+    )
 
-                    if matured:
-                        st.markdown("### 🔵 만기(자동 반환 완료)")
-                        for s in matured[:10]:
-                            st.write(f"- 원금 {int(s['principal'])}, {int(s['weeks'])}주, 이자 {int(s['interest'])}")
+    if p > balance:
+        st.warning("⚠️ 현재 잔액보다 원금이 커서 가입할 수 없어요.")
 
-                    if canceled:
-                        st.markdown("### ⚪ 해지 기록")
-                        for s in canceled[:10]:
-                            st.write(f"- 원금 {int(s['principal'])}, {int(s['weeks'])}주")
-
-        # -------------------------
-        # 3) 목표 저금(목표 설정/달성률)
-        # -------------------------
-
-        from datetime import datetime
-
-        def parse_iso_to_date(iso_str: str):
-            """예: 2026-01-31T01:10:00.000Z -> date"""
-            try:
-                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-                return dt.date()
-            except Exception:
-                return None
-
-        with sub3:
-            st.subheader("🎯 목표 저금(목표 설정/달성률)")
-
-            # 목표 불러오기
-            goal = api_get_goal(name, pin)
-            if not goal.get("ok"):
-                st.error(goal.get("error", "목표 정보를 불러오지 못했어요."))
-            else:
-                cur_goal_amt = int(goal.get("goal_amount", 0) or 0)
-                cur_goal_date = str(goal.get("goal_date", "") or "")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    g_amt = st.number_input(
-                        "목표 금액",
-                        min_value=1,
-                        step=1,
-                        value=cur_goal_amt if cur_goal_amt > 0 else 100,
-                        key=f"goal_amt_{name}"
-                    )
-                with c2:
-                    # 목표 날짜: 저장된 값이 있으면 date로 변환 시도
-                    default_date = date.today() + timedelta(days=30)
-                    if cur_goal_date:
-                        try:
-                            default_date = datetime.fromisoformat(cur_goal_date).date()
-                        except Exception:
-                            pass
-                    g_date = st.date_input("목표 날짜", value=default_date, key=f"goal_date_{name}")
-
-                # 목표 저장
-                if st.button("목표 저장", key=f"goal_save_{name}"):
-                    res = api_set_goal(name, pin, int(g_amt), g_date.isoformat())
-                    if res.get("ok"):
-                        toast("목표 저장 완료!", icon="🎯")
-                        st.rerun()
-                    else:
-                        st.error(res.get("error", "목표 저장 실패"))
-
-                # -------------------------
-                # ✅ 달성률 표시(핵심 수정)
-                # - 현재 잔액(balance)만 보지 말고
-                # - 목표 날짜 이전(포함)에 만기되는 적금의 (원금+이자)도 더해서 '예상 달성률' 계산
-                # -------------------------
-
-                goal_amount = int(g_amt)  # 화면에 입력된 목표 금액을 기준으로 계산
-                goal_date = g_date        # 화면에 입력된 목표 날짜를 기준으로 계산
-                current_balance = int(balance)
-
-                # 적금 목록 불러오기
-                sav = api_savings_list(name, pin)  # ✅ 너 코드에 있는 함수 그대로 사용
-                if isinstance(sav, dict) and sav.get("ok"):
-                    savings_list = sav.get("savings", [])
-                else:
-                    savings_list = []
-
-                # 목표 날짜 이전 만기되는 ACTIVE 적금의 (원금+이자) 합
-                bonus = 0
-                for s in savings_list:
-                    if str(s.get("status", "")).lower() != "active":
-                        continue
-
-                    m_iso = str(s.get("maturity_datetime", "") or "")
-                    m_date = parse_iso_to_date(m_iso)
-                    if not m_date:
-                        continue
-
-                    # 목표 날짜 이전(또는 같은 날) 만기면 포함
-                    if m_date <= goal_date:
-                        principal = int(float(s.get("principal", 0) or 0))
-                        interest = int(float(s.get("interest", 0) or 0))
-                        bonus += (principal + interest)
-
-                expected_amount = current_balance + bonus
-
-                if goal_amount > 0:
-                    now_ratio = min(1.0, current_balance / goal_amount)
-                    exp_ratio = min(1.0, expected_amount / goal_amount)
-                else:
-                    now_ratio = 0.0
-                    exp_ratio = 0.0
-
-                # 보기 좋게 2줄로 표시(학생이 이해 쉬움)
-                st.write(f"현재 잔액 기준: **{now_ratio*100:.1f}%**  (현재 {current_balance} / 목표 {goal_amount})")
-                st.progress(exp_ratio)
-                st.write(f"목표일까지 예상 달성률: **{exp_ratio*100:.1f}%**  (예상 {expected_amount} / 목표 {goal_amount})")
-
-                # 설명(왜 예상이 더 높아지는지)
-                if bonus > 0:
-                    st.info(f"📌 목표 날짜({goal_date.isoformat()}) 이전에 만기되는 적금 수령액(원금+이자) **+{bonus}** 을 예상 금액에 포함했어요.")
-                else:
-                    st.caption(f"목표 날짜({goal_date.isoformat()}) 이전에 만기되는 적금이 없어 예상 금액은 현재 잔액과 같아요.")
-
-        # -------------------------
-        # 통장 내역
-        # -------------------------
-        st.subheader("📒 통장 내역")
-        if len(df) == 0:
-            st.info("아직 거래 내역이 없어요.")
+    if st.button("적금 가입", key=f"sv_join_{name}", disabled=(p > balance)):
+        res = api_savings_create(name, pin, int(p), int(w))
+        if res.get("ok"):
+            toast("적금 가입 완료!", icon="💰")
+            refresh_account_data(name, pin, force=True)
+            st.rerun()
         else:
-            view = df.rename(columns={"datetime": "날짜-시간", "memo": "내역", "deposit": "입금", "withdraw": "출금"})[
-                ["날짜-시간", "내역", "입금", "출금", "총액"]
-            ]
-            st.dataframe(view, use_container_width=True, hide_index=True)
+            st.error(res.get("error", "적금 가입 실패"))
+
+    st.divider()
+
+    # ✅ 여기서는 API를 다시 부르지 않고 캐시된 savings 사용
+    savings = st.session_state.data.get(name, {}).get("savings", [])
+
+    if not savings:
+        st.info("적금이 아직 없어요.")
+    else:
+        active = [s for s in savings if s.get("status") == "active"]
+        matured = [s for s in savings if s.get("status") == "matured"]
+        canceled = [s for s in savings if s.get("status") == "canceled"]
+
+        if active:
+            st.markdown("### 🟢 진행 중 적금")
+            for s in active:
+                sid = s["savings_id"]
+                principal = int(s["principal"])
+                weeks = int(s["weeks"])
+                interest2 = int(s["interest"])
+                maturity_dt = format_kr_datetime(s["maturity_datetime"])
+                st.write(f"- 원금 **{principal}**, 기간 **{weeks}주**, 만기일 **{maturity_dt}**, 만기 이자 **{interest2}**")
+
+                if st.button("해지", key=f"sv_cancel_btn_{name}_{sid}"):
+                    st.session_state[f"sv_cancel_confirm_{sid}"] = True
+
+                if st.session_state.get(f"sv_cancel_confirm_{sid}", False):
+                    st.warning("정말로 해지하시겠습니까? (원금만 반환)")
+                    y, n = st.columns(2)
+                    with y:
+                        if st.button("예", key=f"sv_cancel_yes_{name}_{sid}"):
+                            res = api_savings_cancel(name, pin, sid)
+                            if res.get("ok"):
+                                toast(f"해지 완료! (+{res.get('refunded',0)})", icon="🧾")
+                                st.session_state[f"sv_cancel_confirm_{sid}"] = False
+                                refresh_account_data(name, pin, force=True)
+                                st.rerun()
+                            else:
+                                st.error(res.get("error", "해지 실패"))
+                    with n:
+                        if st.button("아니오", key=f"sv_cancel_no_{name}_{sid}"):
+                            st.session_state[f"sv_cancel_confirm_{sid}"] = False
+                            st.rerun()
+
+        if matured:
+            st.markdown("### 🔵 만기(자동 반환 완료)")
+            for s in matured[:10]:
+                st.write(f"- 원금 {int(s['principal'])}, {int(s['weeks'])}주, 이자 {int(s['interest'])}")
+
+        if canceled:
+            st.markdown("### ⚪ 해지 기록")
+            for s in canceled[:10]:
+                st.write(f"- 원금 {int(s['principal'])}, {int(s['weeks'])}주")
+
+# -------------------------
+# 3) 목표
+# -------------------------
+with sub3:
+    st.subheader("🎯 목표 저금(목표 설정/달성률)")
+
+    # ✅ 목표도 캐시된 goal 사용
+    goal = st.session_state.data.get(name, {}).get("goal", {"ok": False})
+    if not goal.get("ok"):
+        st.error(goal.get("error", "목표 정보를 불러오지 못했어요."))
+    else:
+        cur_goal_amt = int(goal.get("goal_amount", 0) or 0)
+        cur_goal_date = str(goal.get("goal_date", "") or "")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            g_amt = st.number_input(
+                "목표 금액",
+                min_value=1,
+                step=1,
+                value=cur_goal_amt if cur_goal_amt > 0 else 100,
+                key=f"goal_amt_{name}"
+            )
+        with c2:
+            default_date = date.today() + timedelta(days=30)
+            if cur_goal_date:
+                try:
+                    default_date = datetime.fromisoformat(cur_goal_date).date()
+                except Exception:
+                    pass
+            g_date = st.date_input("목표 날짜", value=default_date, key=f"goal_date_{name}")
+
+        if st.button("목표 저장", key=f"goal_save_{name}"):
+            res = api_set_goal(name, pin, int(g_amt), g_date.isoformat())
+            if res.get("ok"):
+                toast("목표 저장 완료!", icon="🎯")
+                refresh_account_data(name, pin, force=True)
+                st.rerun()
+            else:
+                st.error(res.get("error", "목표 저장 실패"))
+
+        goal_amount = int(g_amt)
+        goal_date = g_date
+        current_balance = int(balance)
+
+        savings_list = st.session_state.data.get(name, {}).get("savings", [])
+
+        bonus = 0
+        for s in savings_list:
+            if str(s.get("status", "")).lower() != "active":
+                continue
+            m_iso = str(s.get("maturity_datetime", "") or "")
+            m_date = parse_iso_to_date(m_iso)
+            if not m_date:
+                continue
+            if m_date <= goal_date:
+                principal = int(float(s.get("principal", 0) or 0))
+                interest3 = int(float(s.get("interest", 0) or 0))
+                bonus += (principal + interest3)
+
+        expected_amount = current_balance + bonus
+
+        now_ratio = min(1.0, current_balance / goal_amount) if goal_amount > 0 else 0.0
+        exp_ratio = min(1.0, expected_amount / goal_amount) if goal_amount > 0 else 0.0
+
+        st.write(f"현재 잔액 기준: **{now_ratio*100:.1f}%**  (현재 {current_balance} / 목표 {goal_amount})")
+        st.progress(exp_ratio)
+        st.write(f"목표일까지 예상 달성률: **{exp_ratio*100:.1f}%**  (예상 {expected_amount} / 목표 {goal_amount})")
+
+        if bonus > 0:
+            st.info(f"📌 목표 날짜({goal_date.isoformat()}) 이전 만기 적금 수령액(원금+이자) **+{bonus}** 을 예상 금액에 포함했어요.")
+        else:
+            st.caption(f"목표 날짜({goal_date.isoformat()}) 이전 만기 적금이 없어 예상 금액은 현재 잔액과 같아요.")
+
+# -------------------------
+# 통장 내역 (캐시된 df 사용)
+# -------------------------
+st.subheader("📒 통장 내역")
+if len(df) == 0:
+    st.info("아직 거래 내역이 없어요.")
+else:
+    view = df.rename(columns={"datetime": "날짜-시간", "memo": "내역", "deposit": "입금", "withdraw": "출금"})[
+        ["날짜-시간", "내역", "입금", "출금", "총액"]
+    ]
+    st.dataframe(view, use_container_width=True, hide_index=True)
