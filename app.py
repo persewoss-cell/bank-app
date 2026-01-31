@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 from datetime import datetime, timezone, timedelta, date
 
 WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzwbS_dIJGHTe4oyNK9QMWm0CXqqjgMJ3p-q0MQANqZ0mUQhrHPOIHVSgcH41vrLep-/exec"
@@ -95,13 +96,36 @@ def build_df(headers, rows):
 # API wrappers
 # -------------------------
 def api_get(params: dict):
-    r = SESSION.get(WEBAPP_URL, params=params, timeout=20)
-    return r.json()
+    t0 = time.perf_counter()
+    r = SESSION.get(WEBAPP_URL, params=params, timeout=60)
+    dt = time.perf_counter() - t0
+
+    try:
+        j = r.json()
+    except Exception:
+        j = {"ok": False, "error": "JSON parse 실패", "raw": r.text[:300]}
+
+    j["_client_seconds"] = round(dt, 3)
+    j["_status"] = r.status_code
+    j["_action"] = params.get("action", "")
+    return j
 
 
 def api_post(payload: dict):
-    r = SESSION.post(WEBAPP_URL, json=payload, timeout=20)
-    return r.json()
+    t0 = time.perf_counter()
+    r = SESSION.post(WEBAPP_URL, json=payload, timeout=60)
+    dt = time.perf_counter() - t0
+
+    try:
+        j = r.json()
+    except Exception:
+        j = {"ok": False, "error": "JSON parse 실패", "raw": r.text[:300]}
+
+    j["_client_seconds"] = round(dt, 3)
+    j["_status"] = r.status_code
+    j["_action"] = payload.get("action", "")
+    return j
+
 
 
 # 캐시: 계정/템플릿 (자주 안 바뀜)
@@ -666,6 +690,9 @@ with sub1:
                 st.error("출금 금액이 현재 잔액보다 커요.")
             else:
                 res = api_add_tx(name, pin, memo, deposit, withdraw)
+                st.write("API 시간:", res.get("_client_seconds"),
+                         "| action:", res.get("_action"),
+                         "| status:", res.get("_status"))
                 if res.get("ok"):
                     toast("저장 완료!", icon="✅")
                     st.session_state[clear_key] = True
