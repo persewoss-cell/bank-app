@@ -638,7 +638,18 @@ with sub1:
     dep_key = f"dep_{name}"
     wd_key = f"wd_{name}"
     tpl_sel_key = f"tpl_sel_{name}"
+    clear_flag = f"tx_clear_{name}"
+    if clear_flag not in st.session_state:
+        st.session_state[clear_flag] = False
 
+    # ✅ 다음 run에서만 초기화 (위젯 만들기 전에!)
+    if st.session_state[clear_flag]:
+        st.session_state[memo_key] = ""
+        st.session_state[dep_key] = 0
+        st.session_state[wd_key] = 0
+        st.session_state[tpl_sel_key] = "(직접 입력)"
+        st.session_state[clear_flag] = False
+        
     if memo_key not in st.session_state:
         st.session_state[memo_key] = ""
     if dep_key not in st.session_state:
@@ -714,10 +725,7 @@ with sub1:
             log_api(res, label="add_transaction")
             if res.get("ok"):
                 toast("저장 완료!", icon="✅")
-                st.session_state[memo_key] = ""
-                st.session_state[dep_key] = 0
-                st.session_state[wd_key] = 0
-                st.session_state[tpl_sel_key] = "(직접 입력)"
+                st.session_state[clear_flag] = True
                 refresh_account_data(name, pin, force=True)
                 st.rerun()
             else:
