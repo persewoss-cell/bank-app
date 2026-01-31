@@ -140,6 +140,9 @@ def api_post(payload: dict):
     j["_action"] = payload.get("action", "")
     log_api(j, label=j.get("_action", "api_post"))
     return j
+    
+def api_get_snapshot(name, pin):
+    return api_get({"action": "get_snapshot", "name": name, "pin": pin})
 
 # =========================
 # 캐시(자주 안 바뀌는 것)
@@ -210,39 +213,40 @@ if "tpl_prev" not in st.session_state:
 # 데이터 로딩(한 계정 기준)
 # =========================
 def refresh_account_data(name: str, pin: str, force: bool = False):
+    """한 계정의 화면 데이터를 session_state에 저장.
+    snapshot 한 번만 호출해서 tx/savings/goal/balance/maturity까지 모두 받음.
+    """
     now = datetime.now(KST)
     slot = st.session_state.data.get(name, {})
     last_ts = slot.get("ts")
+
+    # 너무 자주 호출 방지(3초 내 재호출이면 스킵)
     if (not force) and last_ts and (now - last_ts).total_seconds() < 3:
         return
 
-    tx_res = api_get_txs(name, pin)
-    if not tx_res.get("ok"):
-        st.session_state.data[name] = {"error": tx_res.get("error", "내역 로드 실패"), "ts": now}
+    snap = api_get_snapshot(name, pin)
+    if not snap.get("ok"):
+        st.session_state.data[name] = {"error": snap.get("error", "스냅샷 로드 실패"), "ts": now}
         return
 
-    headers = tx_res.get("headers", ["tx_id", "datetime", "memo", "deposit", "withdraw"])
-    rows = tx_res.get("rows", [])
-    df = build_df(headers, rows)
-    balance = int(df["총액"].iloc[-1]) if len(df) else 0
-
-    sres = api_savings_list(name, pin)
-    savings = sres.get("savings", []) if isinstance(sres, dict) and sres.get("ok") else []
+    df = build_df(
+        snap.get("headers", ["tx_id", "datetime", "memo", "deposit", "withdraw"]),
+        snap.get("rows", [])
+    )
 
     st.session_state.data[name] = {
         "df": df,
-        "balance": balance,
-        "savings": savings,
-        "ts": now,
+        "balance": int(snap.get("balance", 0) or 0),
+        "savings": snap.get("savings", []),
+        "goal": {
+            "ok": True,
+            "goal_amount": int(snap.get("goal_amount", 0) or 0),
+            "goal_date": str(snap.get("goal_date", "") or "")
+        },
+        "matured_count": int(snap.get("matured_count", 0) or 0),
+        "paid_total": int(snap.get("paid_total", 0) or 0),
+        "ts": now
     }
-
-def maybe_check_maturities(name: str, pin: str):
-    now = datetime.now(KST)
-    last = st.session_state.last_maturity_check.get(name)
-    if last and (now - last).total_seconds() < 120:
-        return None
-    st.session_state.last_maturity_check[name] = now
-    return api_process_maturities(name, pin)
 
 # =========================
 # Sidebar - 계정 생성/삭제
@@ -355,23 +359,15 @@ if not pin_ok(pin):
     st.stop()
 
 # 만기 자동 처리(2분에 1번만)
-mat = maybe_check_maturities(name, pin)
-if mat and mat.get("ok") and mat.get("matured_count", 0) > 0:
-    st.success(f"🎉 만기 도착! 적금 {mat['matured_count']}건 자동 반환 (+{mat['paid_total']} 포인트)")
-
-# 데이터 로드(거래/적금)
 refresh_account_data(name, pin, force=False)
 slot = st.session_state.data.get(name, {})
 if slot.get("error"):
     st.error(slot["error"])
-    show_api_logs()
     st.stop()
 
-df = slot["df"]
-balance = int(slot["balance"])
-savings_cached = slot.get("savings", [])
-
-st.write(f"### 현재 잔액: **{balance} 포인트**")
+# ✅ snapshot 안에 만기 처리 결과가 들어있음
+if slot.get("matured_count", 0) > 0:
+    st.success(f"🎉 만기 도착! 적금 {slot['matured_count']}건 자동 반환 (+{slot['paid_total']} 포인트)")
 
 # =========================
 # 화면 탭
