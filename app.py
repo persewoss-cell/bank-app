@@ -714,11 +714,23 @@ for idx, tab in enumerate(tabs):
                             st.write(f"- 원금 {int(s['principal'])}, {int(s['weeks'])}주")
 
         # -------------------------
-        # 3) 목표
+        # 3) 목표 저금(목표 설정/달성률)
         # -------------------------
-        with sub3:
-            st.subheader("🎯 목표 적금(목표 설정/달성률)")
 
+        from datetime import datetime
+
+        def parse_iso_to_date(iso_str: str):
+            """예: 2026-01-31T01:10:00.000Z -> date"""
+            try:
+                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                return dt.date()
+            except Exception:
+                return None
+
+        with sub3:
+            st.subheader("🎯 목표 저금(목표 설정/달성률)")
+
+            # 목표 불러오기
             goal = api_get_goal(name, pin)
             if not goal.get("ok"):
                 st.error(goal.get("error", "목표 정보를 불러오지 못했어요."))
@@ -728,8 +740,13 @@ for idx, tab in enumerate(tabs):
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    g_amt = st.number_input("목표 금액", min_value=1, step=1,
-                                            value=cur_goal_amt if cur_goal_amt > 0 else 100, key=f"goal_amt_{name}")
+                    g_amt = st.number_input(
+                        "목표 금액",
+                        min_value=1,
+                        step=1,
+                        value=cur_goal_amt if cur_goal_amt > 0 else 100,
+                        key=f"goal_amt_{name}"
+                    )
                 with c2:
                     # 목표 날짜: 저장된 값이 있으면 date로 변환 시도
                     default_date = date.today() + timedelta(days=30)
@@ -740,6 +757,7 @@ for idx, tab in enumerate(tabs):
                             pass
                     g_date = st.date_input("목표 날짜", value=default_date, key=f"goal_date_{name}")
 
+                # 목표 저장
                 if st.button("목표 저장", key=f"goal_save_{name}"):
                     res = api_set_goal(name, pin, int(g_amt), g_date.isoformat())
                     if res.get("ok"):
@@ -748,15 +766,59 @@ for idx, tab in enumerate(tabs):
                     else:
                         st.error(res.get("error", "목표 저장 실패"))
 
-                # 달성률 표시
-                if cur_goal_amt > 0:
-                    pct = min(100, round(balance / cur_goal_amt * 100, 1))
-                    st.progress(pct / 100)
-                    st.write(f"달성률: **{pct}%**  (현재 {balance} / 목표 {cur_goal_amt})")
-                    if cur_goal_date:
-                        st.caption(f"목표 날짜: {cur_goal_date}")
+                # -------------------------
+                # ✅ 달성률 표시(핵심 수정)
+                # - 현재 잔액(balance)만 보지 말고
+                # - 목표 날짜 이전(포함)에 만기되는 적금의 (원금+이자)도 더해서 '예상 달성률' 계산
+                # -------------------------
 
-        st.divider()
+                goal_amount = int(g_amt)  # 화면에 입력된 목표 금액을 기준으로 계산
+                goal_date = g_date        # 화면에 입력된 목표 날짜를 기준으로 계산
+                current_balance = int(balance)
+
+                # 적금 목록 불러오기
+                sav = api_list_savings(name, pin)  # ✅ 너 코드에 있는 함수 그대로 사용
+                if isinstance(sav, dict) and sav.get("ok"):
+                    savings_list = sav.get("savings", [])
+                else:
+                    savings_list = []
+
+                # 목표 날짜 이전 만기되는 ACTIVE 적금의 (원금+이자) 합
+                bonus = 0
+                for s in savings_list:
+                    if str(s.get("status", "")).lower() != "active":
+                        continue
+
+                    m_iso = str(s.get("maturity_datetime", "") or "")
+                    m_date = parse_iso_to_date(m_iso)
+                    if not m_date:
+                        continue
+
+                    # 목표 날짜 이전(또는 같은 날) 만기면 포함
+                    if m_date <= goal_date:
+                        principal = int(float(s.get("principal", 0) or 0))
+                        interest = int(float(s.get("interest", 0) or 0))
+                        bonus += (principal + interest)
+
+                expected_amount = current_balance + bonus
+
+                if goal_amount > 0:
+                    now_ratio = min(1.0, current_balance / goal_amount)
+                    exp_ratio = min(1.0, expected_amount / goal_amount)
+                else:
+                    now_ratio = 0.0
+                    exp_ratio = 0.0
+
+                # 보기 좋게 2줄로 표시(학생이 이해 쉬움)
+                st.write(f"현재 잔액 기준: **{now_ratio*100:.1f}%**  (현재 {current_balance} / 목표 {goal_amount})")
+                st.progress(exp_ratio)
+                st.write(f"목표일까지 예상 달성률: **{exp_ratio*100:.1f}%**  (예상 {expected_amount} / 목표 {goal_amount})")
+
+                # 설명(왜 예상이 더 높아지는지)
+                if bonus > 0:
+                    st.info(f"📌 목표 날짜({goal_date.isoformat()}) 이전에 만기되는 적금 수령액(원금+이자) **+{bonus}** 을 예상 금액에 포함했어요.")
+                else:
+                    st.caption(f"목표 날짜({goal_date.isoformat()}) 이전에 만기되는 적금이 없어 예상 금액은 현재 잔액과 같아요.")
 
         # -------------------------
         # 통장 내역
