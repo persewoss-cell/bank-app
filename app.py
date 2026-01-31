@@ -664,25 +664,31 @@ with sub1:
 
     labels = ["(직접 입력)"] + [t["label"] for t in TEMPLATES]
 
-    # ✅ form: 입력 중에는 리런 폭발이 줄고, 제출 시에만 처리
+    # ✅ selectbox는 form 밖에서 callback 허용
+    st.selectbox("내역 템플릿", labels, key=tpl_sel_key, on_change=on_template_change)
+
+    # ✅ 입력/저장은 form으로 묶어서 리런 줄이기
     with st.form(key=f"tx_form_{name}", clear_on_submit=False):
-        st.selectbox("내역 템플릿", labels, key=tpl_sel_key, on_change=on_template_change)
         st.text_input("내역", key=memo_key)
 
         st.caption("빠른 입금")
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.form_submit_button("+10"):
-                st.session_state[dep_key] = int(st.session_state[dep_key]) + 10
-                st.session_state[wd_key] = 0
+            q10 = st.form_submit_button("+10")
         with b2:
-            if st.form_submit_button("+50"):
-                st.session_state[dep_key] = int(st.session_state[dep_key]) + 50
-                st.session_state[wd_key] = 0
+            q50 = st.form_submit_button("+50")
         with b3:
-            if st.form_submit_button("+100"):
-                st.session_state[dep_key] = int(st.session_state[dep_key]) + 100
-                st.session_state[wd_key] = 0
+            q100 = st.form_submit_button("+100")
+
+        if q10:
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 10
+            st.session_state[wd_key] = 0
+        if q50:
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 50
+            st.session_state[wd_key] = 0
+        if q100:
+            st.session_state[dep_key] = int(st.session_state[dep_key]) + 100
+            st.session_state[wd_key] = 0
 
         cA, cB = st.columns(2)
         with cA:
@@ -708,12 +714,10 @@ with sub1:
             log_api(res, label="add_transaction")
             if res.get("ok"):
                 toast("저장 완료!", icon="✅")
-                # 입력 초기화
                 st.session_state[memo_key] = ""
                 st.session_state[dep_key] = 0
                 st.session_state[wd_key] = 0
                 st.session_state[tpl_sel_key] = "(직접 입력)"
-                # 데이터 갱신
                 refresh_account_data(name, pin, force=True)
                 st.rerun()
             else:
