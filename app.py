@@ -777,7 +777,7 @@ for idx, tab in enumerate(tabs):
                 current_balance = int(balance)
 
                 # 적금 목록 불러오기
-                sav = api_list_savings(name, pin)  # ✅ 너 코드에 있는 함수 그대로 사용
+               sav = api_savings_list(name, pin)  # ✅ 너 코드에 있는 함수 그대로 사용
                 if isinstance(sav, dict) and sav.get("ok"):
                     savings_list = sav.get("savings", [])
                 else:
