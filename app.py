@@ -527,6 +527,17 @@ for idx, tab in enumerate(tabs):
                 st.session_state[wd_key] = 0
             if tpl_sel_key not in st.session_state:
                 st.session_state[tpl_sel_key] = "(직접 입력)"
+            # ✅ 저장 후 입력칸 초기화는 '다음 실행(run)'에서만 처리(크래시 방지)
+            clear_key = f"clear_after_save_{name}"
+            if clear_key not in st.session_state:
+                st.session_state[clear_key] = False
+
+            if st.session_state[clear_key]:
+                st.session_state[memo_key] = ""
+                st.session_state[dep_key] = 0
+                st.session_state[wd_key] = 0
+                st.session_state[tpl_sel_key] = "(직접 입력)"
+                st.session_state[clear_key] = False
 
             def on_template_change():
                 sel = st.session_state[tpl_sel_key]
@@ -588,10 +599,7 @@ for idx, tab in enumerate(tabs):
                         res = api_add_tx(name, pin, memo, deposit, withdraw)
                         if res.get("ok"):
                             toast("저장 완료!", icon="✅")
-                            st.session_state[memo_key] = ""
-                            st.session_state[dep_key] = 0
-                            st.session_state[wd_key] = 0
-                            st.session_state[tpl_sel_key] = "(직접 입력)"
+                            st.session_state[clear_key] = True
                             st.rerun()
                         else:
                             st.error(res.get("error", "저장 실패"))
